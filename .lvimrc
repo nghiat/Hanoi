@@ -1,0 +1,5 @@
+let g:rooter_patterns = ['.lvimrc']
+
+noremap <F9> :terminal cargo build<CR>
+
+set tags+=d:/projects/tags/rust_tags

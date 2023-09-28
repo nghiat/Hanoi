@@ -1,0 +1,6 @@
+.vs/
+debug/
+target/
+
+Cargo.lock
+tags
