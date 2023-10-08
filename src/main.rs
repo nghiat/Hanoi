@@ -1,17 +1,61 @@
-use std::io::{self, ErrorKind};
+use clap::{Parser, ValueEnum};
+use std::io::{self, BufRead, BufReader, ErrorKind};
 use std::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::time::Instant;
-use interprocess::local_socket::LocalSocketListener;
+use interprocess::local_socket::{LocalSocketListener, LocalSocketStream};
+use std::io::Read;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use notify::{
+    event::{self, EventKind},
+    Watcher, RecommendedWatcher, RecursiveMode, Result
+};
+use regex::Regex;
 
-fn filter_files(dir_entry: &DirEntry) -> bool {
-    if let Some(ext) = dir_entry.path().extension() {
-        if ext == "cpp" || ext == "h" || ext == "inl" || ext == "cs" {
-            return true
+#[derive(ValueEnum, Clone)]
+enum OperatingMode {
+    Server,
+    Client,
+}
+
+enum Filter {
+    Include(Regex),
+    Exclude(Regex),
+}
+
+#[derive(Parser)]
+struct Args {
+    #[clap(value_enum, default_value_t = OperatingMode::Client)]
+    #[arg(long)]
+    mode: OperatingMode,
+
+    #[arg(long)]
+    root: Option<String>,
+
+    term: Option<String>,
+}
+
+fn filter_file(configs: &Vec<Filter>, path: &Path, root: &Path) -> bool {
+    let mut result = false;
+    if let Ok(rel_path) = path.strip_prefix(root) {
+        for filter in configs {
+            match(filter) {
+                Filter::Include(re) => {
+                    if re.is_match(rel_path.display().to_string().as_str()) {
+                        result = true;
+                    }
+                }
+                Filter::Exclude(re) => {
+                    if re.is_match(rel_path.display().to_string().as_str()) {
+                        result = false;
+                    }
+                }
+            }
         }
     }
-    false
+    result
 }
 
 fn visit_dirs(dir: &Path, cb: &mut impl FnMut(&DirEntry)) -> io::Result<()> {
@@ -51,79 +95,37 @@ impl Drop for ScopeTime {
 }
 
 #[derive(Default)]
-struct Indexer1 {
-    total_len: u64,
-    total_files: u64,
-    combined_files: String,
-    start_indices: Vec<usize>,
-    paths: Vec<PathBuf>,
-}
-
-pub trait Indexer {
-    fn build(&mut self, path: &Path);
-    fn find(&self, term: &str);
-}
-
-impl Indexer for Indexer1 {
-    fn build(&mut self, path: &Path) {
-        let mut calculate_metadata = |dir_entry: &DirEntry| {
-            if !filter_files(dir_entry) {
-                return;
-            }
-            if let Ok(metadata) = dir_entry.metadata() {
-                self.total_len += metadata.len();
-                self.total_files += 1;
-            }
-        };
-        let _ = visit_dirs(&path, &mut calculate_metadata);
-        self.combined_files.reserve(self.total_len.try_into().unwrap());
-        self.start_indices = Vec::with_capacity(self.total_files.try_into().unwrap());
-        self.paths = Vec::with_capacity(self.total_files.try_into().unwrap());
-        let mut current_start_idx = 0;
-        let mut append_to_combined_files = |dir_entry: &DirEntry| {
-            if !filter_files(dir_entry) {
-                return;
-            }
-            if let Ok(file_str) = std::fs::read_to_string(dir_entry.path().as_path()) {
-                self.combined_files.push_str(&file_str);
-                self.start_indices.push(current_start_idx);
-                current_start_idx += file_str.len();
-                self.paths.push(dir_entry.path());
-            }
-        };
-        let _ = visit_dirs(&path, &mut append_to_combined_files);
-        self.start_indices.push(current_start_idx);
-        println!("Done indexing");
-    }
-
-    fn find(&self, term: &str) {
-        let mut start = 0;
-        let mut occurrences = Vec::new();
-        while let Some(pos) = self.combined_files[start..].find(&term) {
-            let found_at = start + pos;
-            occurrences.push(found_at);
-            start = found_at + term.len();
-        }
-        let mut o_i = 0;
-        for i in 0..self.start_indices.len() - 1 {
-            while o_i < occurrences.len() && occurrences[o_i] >= self.start_indices[i] && occurrences[o_i] < self.start_indices[i + 1] {
-                // println!("{}", self.paths[i].display());
-                o_i += 1;
-            }
-        }
-        println!("Done finding");
-    }
-}
-
-#[derive(Default)]
 struct Indexer2 {
+    root: PathBuf,
     files: HashMap<PathBuf, String>,
+    filters: Vec<Filter>,
 }
 
-impl Indexer for Indexer2 {
+impl Indexer2 {
+    const ENDING_MSG: &str = "###end###";
+}
+
+impl Indexer2 {
     fn build(&mut self, path: &Path) {
+        self.root = PathBuf::from(path);
+        let config_path = Path::new(path).join(".hanoi");
+        self.filters = Vec::new();
+        if let Ok(config_str) = std::fs::read_to_string(config_path) {
+            for line in config_str.lines() {
+                if line.trim().starts_with("#") {
+                    // Ignore comment
+                    continue;
+                }
+                if line.trim().starts_with("!") {
+                    self.filters.push(Filter::Exclude(Regex::new(&line.trim()[1..]).unwrap()));
+                } else {
+                    self.filters.push(Filter::Include(Regex::new(&line.trim()).unwrap()));
+                }
+            }
+        }
+
         let mut load_files = |dir_entry: &DirEntry| {
-            if !filter_files(dir_entry) {
+            if !filter_file(&self.filters, dir_entry.path().as_path(), &path) {
                 return;
             }
             let path_buf = dir_entry.path();
@@ -135,59 +137,150 @@ impl Indexer for Indexer2 {
         println!("Indexer2: Done building");
     }
 
-    fn find(&self, term: &str) {
+    fn find(&self, term: &str, reader: &mut BufReader<LocalSocketStream>) {
         for (key, value) in &self.files {
             if let Some(pos) = value.find(&term) {
-                // println!("{}", key.display());
+                let mut line_num = 1;
+                for line in value.lines() {
+                    if let Some(pos) = line.find(&term) {
+                        reader.get_mut().write_all(format!("{}:{}: {}", key.display().to_string(), line_num, line).as_bytes());
+                        reader.get_mut().write(b"\n");
+                    }
+                    line_num += 1;
+                }
             }
+        }
+    }
+
+    fn handle_event(&mut self, event: &event::Event) {
+        match event.kind {
+            EventKind::Create(_) | EventKind::Modify(_) => {
+                for path in &event.paths {
+                    if filter_file(&self.filters, path, self.root.as_path()) && path.is_file() {
+                        if let Ok(file_str) = std::fs::read_to_string(path.as_path()) {
+                            self.files.insert(PathBuf::clone(path), file_str);
+                        }
+                    }
+                }
+            },
+            EventKind::Remove(remove) => {
+                for path in &event.paths {
+                    if filter_file(&self.filters, path, self.root.as_path()) && path.is_file() {
+                        self.files.remove(path);
+                    }
+                }
+            },
+            _ => {}
         }
     }
 }
 
-fn main() {
-    let path = Path::new("D:/projects/UnrealEngine");
-    let mut parent_path = path;
-    let mut has_named_pipe = false;
-    let mut named_pipe : LocalSocketListener;
+fn find_existing_pipe_name(path: &Path) -> Option<PathBuf> {
+    let mut named_pipe_path = path;
     loop {
-        if LocalSocketListener::bind(parent_path).is_err_and(|x| x.kind() == ErrorKind::PermissionDenied) {
-            has_named_pipe = true;
-            println!("named_pipe exists");
+        if LocalSocketListener::bind(named_pipe_path).is_err_and(|x| x.kind() == ErrorKind::PermissionDenied) {
+            return Some(named_pipe_path.to_path_buf());
         }
-        let new_parent_path = parent_path.parent();
-        match new_parent_path {
-            Some(v) => parent_path = v,
+        let parent_path = named_pipe_path.parent();
+        match parent_path {
+            Some(v) => named_pipe_path = v,
             None => break,
         }
     }
-    if !has_named_pipe {
-        named_pipe = LocalSocketListener::bind(path).unwrap();
+    None
+}
+
+fn server_main(args: &Args) {
+    let root_str = args.root.as_ref().unwrap();
+    let path = Path::new(root_str.as_str());
+    let existing_pipe_name = find_existing_pipe_name(&path);
+    if let Some(existing_pipe_name) = find_existing_pipe_name(&path) {
+        println!("This directory or its parent directory has been indexed: {}", existing_pipe_name.display());
+        return;
     }
-    let mut indexer1 = Indexer1::default();
-    {
-        let scope_time = ScopeTime::default();
-        indexer1.build(&path);
-    }
+
+    println!("Start indexing: {}", path.display());
+    let named_pipe = LocalSocketListener::bind(path).unwrap();
 
     let mut indexer2 = Indexer2::default();
     {
         let scope_time = ScopeTime::default();
         indexer2.build(&path);
     }
-    loop {
-        let mut term = String::new();
-        io::stdin()
-            .read_line(&mut term)
-            .expect("Failed to read line");
+    let indexer2 = Arc::new(Mutex::new(indexer2));
+    let mut watcher;
+    {
+        let indexer2 = indexer2.clone();
+        watcher = notify::recommended_watcher(move |res: Result<event::Event>| {
+            match res {
+               Ok(event) => indexer2.lock().unwrap().handle_event(&event),
+               Err(e) => println!("watch error: {:?}", e),
+            }
+        }).unwrap();
+    }
+    watcher.watch(&path, RecursiveMode::Recursive);
 
-        term = String::from(term.trim());
-        {
-            let scope_time = ScopeTime::default();
-            indexer1.find(&term);
+    loop {
+        for incoming in named_pipe.incoming() {
+            if let Some(stream) = incoming.ok() {
+                let mut incoming_reader = BufReader::new(stream);
+                let mut buffer = String::with_capacity(128);
+                incoming_reader.read_line(&mut buffer);
+                let client_args = Args::parse_from(buffer.trim().split(" "));
+                if let Some(term) = client_args.term {
+                    indexer2.lock().unwrap().find(&term.as_str(), &mut incoming_reader);
+                }
+                incoming_reader.get_mut().write_all(Indexer2::ENDING_MSG.as_bytes());
+                incoming_reader.get_mut().write(b"\n");
+            }
         }
-        {
-            let scope_time = ScopeTime::default();
-            indexer2.find(&term);
+    }
+}
+
+fn client_main(args: &Args) {
+    let current_dir = std::env::current_dir().unwrap();
+    let existing_pipe_name = find_existing_pipe_name(&current_dir.as_path());
+    match existing_pipe_name {
+        None => {
+            println!("Please start the server for the current or parent directory");
+        }
+        Some(existing_pipe_name) => {
+            if let Ok(named_pipe) = LocalSocketStream::connect(existing_pipe_name) {
+                let mut pipe_buffer = BufReader::new(named_pipe);
+                let mut all_args : Vec<String> = Vec::new();
+                for argument in std::env::args() {
+                    all_args.push(argument);
+                }
+                pipe_buffer.get_mut().write_all(all_args.join(" ").as_bytes());
+                pipe_buffer.get_mut().write(b"\n");
+                {
+                    let mut msg = String::with_capacity(128);
+                    loop {
+                        pipe_buffer.read_line(&mut msg);
+                        let trimmed_msg = msg.trim();
+                        if trimmed_msg != Indexer2::ENDING_MSG {
+                            println!("{trimmed_msg}");
+                        } else {
+                            break;
+                        }
+                        msg.clear();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    let args = Args::parse();
+    let mut has_named_pipe = false;
+    let mode = OperatingMode::Server;
+    match args.mode {
+        OperatingMode::Server => {
+            server_main(&args);
+        }
+        OperatingMode::Client => {
+            client_main(&args);
         }
     }
 }

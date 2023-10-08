@@ -9,3 +9,4 @@ edition = "2021"
 clap = { version = "4.4.4", features = ["derive"] }
 interprocess = "1.2.1"
 notify = "6.1.1"
+regex = "1.9.6"
