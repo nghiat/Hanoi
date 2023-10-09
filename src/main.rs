@@ -12,7 +12,6 @@ use notify::{
     event::{self, EventKind},
     Watcher, RecommendedWatcher, RecursiveMode, Result
 };
-use regex::Regex;
 
 #[derive(ValueEnum, Clone)]
 enum OperatingMode {
@@ -20,9 +19,12 @@ enum OperatingMode {
     Client,
 }
 
-enum Filter {
-    Include(Regex),
-    Exclude(Regex),
+struct Filter {
+    should_include: bool,
+    should_start_with: bool,
+    should_end_with: bool,
+    only_dir: bool,
+    pattern: String,
 }
 
 #[derive(Parser)]
@@ -37,20 +39,34 @@ struct Args {
     term: Option<String>,
 }
 
-fn filter_file(configs: &Vec<Filter>, path: &Path, root: &Path) -> bool {
-    let mut result = false;
+fn filter_path(filters: &Vec<Filter>, path: &Path, root: &Path) -> bool {
+    let mut result;
+    if path.is_dir() {
+        result = true;
+    } else {
+        result = false;
+    }
     if let Ok(rel_path) = path.strip_prefix(root) {
-        for filter in configs {
-            match(filter) {
-                Filter::Include(re) => {
-                    if re.is_match(rel_path.display().to_string().as_str()) {
-                        result = true;
-                    }
+        let rel_path_str = rel_path.display().to_string();
+
+        for filter in filters {
+            let pattern = filter.pattern.as_str();
+            if filter.only_dir && !path.is_dir() {
+                continue;
+            }
+            if filter.should_start_with && filter.should_end_with {
+                if pattern == rel_path_str {
+                    result = filter.should_include;
                 }
-                Filter::Exclude(re) => {
-                    if re.is_match(rel_path.display().to_string().as_str()) {
-                        result = false;
-                    }
+            } else if filter.should_start_with || filter.should_end_with {
+                if filter.should_start_with && rel_path_str.starts_with(pattern) {
+                    result = filter.should_include;
+                } else if filter.should_end_with && rel_path_str.ends_with(pattern) {
+                    result = filter.should_include;
+                }
+            } else {
+                if rel_path_str.contains(pattern) {
+                    result = filter.should_include;
                 }
             }
         }
@@ -58,13 +74,15 @@ fn filter_file(configs: &Vec<Filter>, path: &Path, root: &Path) -> bool {
     result
 }
 
-fn visit_dirs(dir: &Path, cb: &mut impl FnMut(&DirEntry)) -> io::Result<()> {
+fn visit_dirs(dir: &Path, cb: &mut impl FnMut(&DirEntry), root: &Path, filters: &Vec<Filter>) -> io::Result<()> {
     if dir.is_dir() {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                visit_dirs(&path, cb)?;
+                if filter_path(&filters, path.as_path(), &root) {
+                    visit_dirs(&path, cb, &root, &filters)?;
+                }
             } else {
                 cb(&entry);
             }
@@ -98,7 +116,6 @@ impl Drop for ScopeTime {
 struct Indexer2 {
     root: PathBuf,
     files: HashMap<PathBuf, String>,
-    filters: Vec<Filter>,
 }
 
 impl Indexer2 {
@@ -106,26 +123,11 @@ impl Indexer2 {
 }
 
 impl Indexer2 {
-    fn build(&mut self, path: &Path) {
+    fn build(&mut self, path: &Path, filters: &Vec<Filter>) {
         self.root = PathBuf::from(path);
-        let config_path = Path::new(path).join(".hanoi");
-        self.filters = Vec::new();
-        if let Ok(config_str) = std::fs::read_to_string(config_path) {
-            for line in config_str.lines() {
-                if line.trim().starts_with("#") {
-                    // Ignore comment
-                    continue;
-                }
-                if line.trim().starts_with("!") {
-                    self.filters.push(Filter::Exclude(Regex::new(&line.trim()[1..]).unwrap()));
-                } else {
-                    self.filters.push(Filter::Include(Regex::new(&line.trim()).unwrap()));
-                }
-            }
-        }
 
         let mut load_files = |dir_entry: &DirEntry| {
-            if !filter_file(&self.filters, dir_entry.path().as_path(), &path) {
+            if !filter_path(&filters, dir_entry.path().as_path(), &path) {
                 return;
             }
             let path_buf = dir_entry.path();
@@ -133,7 +135,7 @@ impl Indexer2 {
                 self.files.insert(path_buf, file_str);
             }
         };
-        let _ = visit_dirs(&path, &mut load_files);
+        let _ = visit_dirs(&path, &mut load_files, &self.root.as_path(), &filters);
         println!("Indexer2: Done building");
     }
 
@@ -152,11 +154,12 @@ impl Indexer2 {
         }
     }
 
-    fn handle_event(&mut self, event: &event::Event) {
+    fn handle_event(&mut self, event: &event::Event, filters: &Vec<Filter>) {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 for path in &event.paths {
-                    if filter_file(&self.filters, path, self.root.as_path()) && path.is_file() {
+                    if filter_path(&filters, path, self.root.as_path()) && path.is_file() {
+                        println!("handle create event: {}", path.display());
                         if let Ok(file_str) = std::fs::read_to_string(path.as_path()) {
                             self.files.insert(PathBuf::clone(path), file_str);
                         }
@@ -165,7 +168,8 @@ impl Indexer2 {
             },
             EventKind::Remove(remove) => {
                 for path in &event.paths {
-                    if filter_file(&self.filters, path, self.root.as_path()) && path.is_file() {
+                    if filter_path(&filters, path, self.root.as_path()) && path.is_file() {
+                        println!("handle remove event: {}", path.display());
                         self.files.remove(path);
                     }
                 }
@@ -202,10 +206,54 @@ fn server_main(args: &Args) {
     println!("Start indexing: {}", path.display());
     let named_pipe = LocalSocketListener::bind(path).unwrap();
 
+    let mut filters: Vec<Filter> = Vec::new();
+    let config_path = Path::new(path).join(".hanoi");
+    if let Ok(config_str) = std::fs::read_to_string(config_path) {
+        for line in config_str.lines() {
+            let mut line = line.trim();
+            if line.is_empty() || line.starts_with("#") {
+                // Ignore comment
+                continue;
+            }
+
+            let mut filter = Filter {
+                should_include : true,
+                should_start_with : true,
+                should_end_with : true,
+                only_dir : false,
+                pattern : String::new(),
+            };
+            if line.starts_with("!") {
+                filter.should_include = false;
+                line = &line[1..]
+            }
+            if line.starts_with("*") {
+                filter.should_start_with = false;
+                line = &line[1..]
+            }
+            if line.ends_with("*") {
+                filter.should_end_with = false;
+                line = &line[0..line.len() - 1]
+            }
+            if line.ends_with("/") {
+                filter.only_dir = true;
+                line = &line[0..line.len() - 1]
+            }
+            let mut pattern = String::from(line);
+            if cfg!(target_os = "windows") {
+                pattern = pattern.replace("/", "\\");
+            } else {
+                pattern = pattern.replace("\\", "/");
+            }
+            filter.pattern = pattern;
+            filters.push(filter);
+        }
+    }
+
     let mut indexer2 = Indexer2::default();
     {
         let scope_time = ScopeTime::default();
-        indexer2.build(&path);
+        indexer2.build(&path, &filters);
     }
     let indexer2 = Arc::new(Mutex::new(indexer2));
     let mut watcher;
@@ -213,7 +261,7 @@ fn server_main(args: &Args) {
         let indexer2 = indexer2.clone();
         watcher = notify::recommended_watcher(move |res: Result<event::Event>| {
             match res {
-               Ok(event) => indexer2.lock().unwrap().handle_event(&event),
+               Ok(event) => indexer2.lock().unwrap().handle_event(&event, &filters),
                Err(e) => println!("watch error: {:?}", e),
             }
         }).unwrap();
