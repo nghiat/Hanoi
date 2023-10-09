@@ -39,19 +39,15 @@ struct Args {
     term: Option<String>,
 }
 
-fn filter_path(filters: &Vec<Filter>, path: &Path, root: &Path) -> bool {
-    let mut result;
-    if path.is_dir() {
-        result = true;
-    } else {
-        result = false;
-    }
+fn filter_path(filters: &Vec<Filter>, path: &Path, root: &Path, is_dir: bool) -> bool {
+    // Ignore files by default, but not dir
+    let mut result = is_dir;
     if let Ok(rel_path) = path.strip_prefix(root) {
         let rel_path_str = rel_path.display().to_string();
 
         for filter in filters {
             let pattern = filter.pattern.as_str();
-            if filter.only_dir && !path.is_dir() {
+            if filter.only_dir && !is_dir {
                 continue;
             }
             if filter.should_start_with && filter.should_end_with {
@@ -80,7 +76,7 @@ fn visit_dirs(dir: &Path, cb: &mut impl FnMut(&DirEntry), root: &Path, filters: 
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                if filter_path(&filters, path.as_path(), &root) {
+                if filter_path(&filters, path.as_path(), &root, true) {
                     visit_dirs(&path, cb, &root, &filters)?;
                 }
             } else {
@@ -127,7 +123,7 @@ impl Indexer2 {
         self.root = PathBuf::from(path);
 
         let mut load_files = |dir_entry: &DirEntry| {
-            if !filter_path(&filters, dir_entry.path().as_path(), &path) {
+            if !filter_path(&filters, dir_entry.path().as_path(), &path, false) {
                 return;
             }
             let path_buf = dir_entry.path();
@@ -158,7 +154,7 @@ impl Indexer2 {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 for path in &event.paths {
-                    if filter_path(&filters, path, self.root.as_path()) && path.is_file() {
+                    if filter_path(&filters, path, self.root.as_path(), true) && path.is_file() {
                         println!("handle create event: {}", path.display());
                         if let Ok(file_str) = std::fs::read_to_string(path.as_path()) {
                             self.files.insert(PathBuf::clone(path), file_str);
@@ -168,7 +164,7 @@ impl Indexer2 {
             },
             EventKind::Remove(remove) => {
                 for path in &event.paths {
-                    if filter_path(&filters, path, self.root.as_path()) && path.is_file() {
+                    if filter_path(&filters, path, self.root.as_path(), true) && path.is_file() {
                         println!("handle remove event: {}", path.display());
                         self.files.remove(path);
                     }
