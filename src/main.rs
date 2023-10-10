@@ -7,7 +7,9 @@ use std::time::Instant;
 use interprocess::local_socket::{LocalSocketListener, LocalSocketStream};
 use std::io::Read;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::cmp::min;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use notify::{
     event::{self, EventKind},
     Watcher, RecommendedWatcher, RecursiveMode, Result
@@ -25,6 +27,11 @@ struct Filter {
     should_end_with: bool,
     only_dir: bool,
     pattern: String,
+}
+
+struct WorkQueue {
+    paths: Vec<PathBuf>,
+    has_stopped: bool,
 }
 
 #[derive(Parser)]
@@ -122,16 +129,77 @@ impl Indexer2 {
     fn build(&mut self, path: &Path, filters: &Vec<Filter>) {
         self.root = PathBuf::from(path);
 
+        let mut handles = vec![];
+        let thread_count = 10;
+        let files_per_thread = 16;
+        let work_queue = WorkQueue {
+            paths: Vec::with_capacity(thread_count * files_per_thread),
+            has_stopped: false,
+        };
+        let pair = Arc::new((Mutex::new(work_queue), Condvar::new()));
+        for _ in 0..thread_count {
+            let pair2 = Arc::clone(&pair);
+            let handle = thread::spawn(move || {
+                let mut files: HashMap<PathBuf, String> = Default::default();
+                let mut paths: Vec<PathBuf> = Vec::with_capacity(files_per_thread);
+                let (lock, cvar) = &*pair2;
+                loop {
+                    let mut work_queue = lock.lock().unwrap();
+                    while !work_queue.has_stopped && work_queue.paths.is_empty() {
+                        work_queue = cvar.wait(work_queue).unwrap();
+                    }
+                    let path_in_queue_count = work_queue.paths.len();
+                    if path_in_queue_count > 0 {
+                        let file_count = min(path_in_queue_count, files_per_thread);
+                        for i in 0..file_count {
+                            paths.push(work_queue.paths.pop().unwrap());
+                        }
+                    }
+                    let should_stopped = work_queue.has_stopped && work_queue.paths.is_empty();
+                    drop(work_queue);
+                    for path in &paths {
+                        if let Ok(file_str) = std::fs::read_to_string(path) {
+                            files.insert(PathBuf::from(path), file_str);
+                        }
+                    }
+                    if should_stopped {
+                        break;
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        let mut paths = Vec::<PathBuf>::with_capacity(thread_count * files_per_thread);
         let mut load_files = |dir_entry: &DirEntry| {
             if !filter_path(&filters, dir_entry.path().as_path(), &path, false) {
                 return;
             }
-            let path_buf = dir_entry.path();
-            if let Ok(file_str) = std::fs::read_to_string(path_buf.as_path()) {
-                self.files.insert(path_buf, file_str);
+
+            paths.push(dir_entry.path());
+            if paths.len() > files_per_thread {
+                let (lock, cvar) = &*pair;
+                let mut work_queue = lock.lock().unwrap();
+                for i in 0..files_per_thread {
+                    work_queue.paths.push(paths.pop().unwrap());
+                }
+                cvar.notify_all();
             }
         };
+
         let _ = visit_dirs(&path, &mut load_files, &self.root.as_path(), &filters);
+
+        let (lock, cvar) = &*pair;
+        let mut work_queue = lock.lock().unwrap();
+        if paths.len() > 0 {
+            work_queue.paths.append(&mut paths);
+        }
+        work_queue.has_stopped = true;
+        // We notify the condvar that the value has changed.
+        cvar.notify_all();
+        for handle in handles {
+            handle.join().unwrap();
+        }
         println!("Indexer2: Done building");
     }
 
