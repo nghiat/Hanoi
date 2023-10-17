@@ -43,6 +43,10 @@ struct Args {
     #[arg(long)]
     root: Option<String>,
 
+    #[clap(default_value_t = false)]
+    #[arg(long)]
+    files: bool,
+
     term: Option<String>,
 }
 
@@ -221,6 +225,13 @@ impl Indexer2 {
         }
     }
 
+    fn list_files(&self, reader: &mut BufReader<LocalSocketStream>) {
+        for (key, value) in &self.files {
+            reader.get_mut().write_all(format!("{}", key.display().to_string()).as_bytes());
+            reader.get_mut().write(b"\n");
+        }
+    }
+
     fn handle_event(&mut self, event: &event::Event, filters: &Vec<Filter>) {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
@@ -342,7 +353,9 @@ fn server_main(args: &Args) {
                 let mut buffer = String::with_capacity(128);
                 incoming_reader.read_line(&mut buffer);
                 let client_args = Args::parse_from(buffer.trim().split(" "));
-                if let Some(term) = client_args.term {
+                if client_args.files {
+                    indexer2.lock().unwrap().list_files(&mut incoming_reader);
+                } else if let Some(term) = client_args.term {
                     indexer2.lock().unwrap().find(&term.as_str(), &mut incoming_reader);
                 }
                 incoming_reader.get_mut().write_all(Indexer2::ENDING_MSG.as_bytes());
