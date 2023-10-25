@@ -47,6 +47,10 @@ struct Args {
     #[arg(long)]
     files: bool,
 
+    #[clap(default_value_t = false)]
+    #[arg(long, short)]
+    word: bool,
+
     term: Option<String>,
 }
 
@@ -58,9 +62,9 @@ fn filter_path(filters: &Vec<Filter>, path: &Path, root: &Path, is_dir: bool) ->
 
         for filter in filters {
             let pattern = filter.pattern.as_str();
-            if filter.only_dir && !is_dir {
-                continue;
-            }
+            // if filter.only_dir && !is_dir {
+            //     continue;
+            // }
             if filter.should_start_with && filter.should_end_with {
                 if pattern == rel_path_str {
                     result = filter.should_include;
@@ -127,6 +131,7 @@ struct Indexer2 {
 
 impl Indexer2 {
     const ENDING_MSG: &str = "###end###";
+    const ARG_SEP: &str = "\t";
 }
 
 impl Indexer2 {
@@ -210,12 +215,31 @@ impl Indexer2 {
         println!("Indexer2: Done building");
     }
 
-    fn find(&self, term: &str, reader: &mut BufReader<LocalSocketStream>) {
+    fn find(&self, args: &Args, reader: &mut BufReader<LocalSocketStream>) {
+        if args.term.is_none() {
+            return;
+        }
+        let term = args.term.as_ref().unwrap().as_str();
         for (key, value) in &self.files {
             if let Some(pos) = value.find(&term) {
                 let mut line_num = 1;
                 for line in value.lines() {
-                    if let Some(pos) = line.find(&term) {
+                    if let Some(mut pos) = line.find(&term) {
+                        let mut found = false;
+                        if args.word {
+                            let line_bytes = line.as_bytes();
+                            for (pos, _) in line.match_indices(term) {
+                                if !((pos > 0 && line_bytes[pos - 1].is_ascii_alphanumeric()) || (pos + term.len() < line.len() - 1 && line_bytes[pos + term.len()].is_ascii_alphanumeric())) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            found = true;
+                        }
+                        if !found {
+                            continue;
+                        }
                         reader.get_mut().write_all(format!("{}:{}: {}", key.display().to_string(), line_num, line).as_bytes());
                         reader.get_mut().write(b"\n");
                     }
@@ -236,7 +260,7 @@ impl Indexer2 {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 for path in &event.paths {
-                    if filter_path(&filters, path, self.root.as_path(), true) && path.is_file() {
+                    if filter_path(&filters, path, self.root.as_path(), false) && path.is_file() {
                         println!("handle create event: {}", path.display());
                         if let Ok(file_str) = std::fs::read_to_string(path.as_path()) {
                             self.files.insert(PathBuf::clone(path), file_str);
@@ -246,7 +270,7 @@ impl Indexer2 {
             },
             EventKind::Remove(remove) => {
                 for path in &event.paths {
-                    if filter_path(&filters, path, self.root.as_path(), true) && path.is_file() {
+                    if filter_path(&filters, path, self.root.as_path(), false) && path.is_file() {
                         println!("handle remove event: {}", path.display());
                         self.files.remove(path);
                     }
@@ -352,11 +376,11 @@ fn server_main(args: &Args) {
                 let mut incoming_reader = BufReader::new(stream);
                 let mut buffer = String::with_capacity(128);
                 incoming_reader.read_line(&mut buffer);
-                let client_args = Args::parse_from(buffer.trim().split(" "));
+                let client_args = Args::parse_from(buffer.trim().split(Indexer2::ARG_SEP));
                 if client_args.files {
                     indexer2.lock().unwrap().list_files(&mut incoming_reader);
-                } else if let Some(term) = client_args.term {
-                    indexer2.lock().unwrap().find(&term.as_str(), &mut incoming_reader);
+                } else {
+                    indexer2.lock().unwrap().find(&client_args, &mut incoming_reader);
                 }
                 incoming_reader.get_mut().write_all(Indexer2::ENDING_MSG.as_bytes());
                 incoming_reader.get_mut().write(b"\n");
@@ -379,7 +403,7 @@ fn client_main(args: &Args) {
                 for argument in std::env::args() {
                     all_args.push(argument);
                 }
-                pipe_buffer.get_mut().write_all(all_args.join(" ").as_bytes());
+                pipe_buffer.get_mut().write_all(all_args.join(Indexer2::ARG_SEP).as_bytes());
                 pipe_buffer.get_mut().write(b"\n");
                 {
                     let mut msg = String::with_capacity(128);
