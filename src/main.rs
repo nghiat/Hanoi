@@ -1,21 +1,34 @@
+use bincode::{
+    self,
+    config::{self, Config},
+    Decode,
+    Encode
+};
 use clap::{Parser, ValueEnum};
-use std::io::{self, BufRead, BufReader, ErrorKind};
-use std::fs::{self, DirEntry};
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
-use std::time::Instant;
 use interprocess::local_socket::{LocalSocketListener, LocalSocketStream};
-use std::io::Read;
-use std::io::Write;
-use std::cmp::min;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 use notify::{
-    event::{self, EventKind},
-    Watcher, RecommendedWatcher, RecursiveMode, Result
+    event::{Event, EventKind},
+    RecursiveMode, Result, Watcher,
+};
+use rand::distributions::Alphanumeric;
+use rand::{self, Rng};
+
+use std::{
+    cmp::{self},
+    collections::hash_map::DefaultHasher,
+    collections::HashMap,
+    fs::{self, DirEntry},
+    hash::Hasher,
+    io::{self, BufRead, BufReader, ErrorKind, Read, Write},
+    mem::{self},
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+    thread,
 };
 
-#[derive(ValueEnum, Clone)]
+#[derive(Encode, Decode, ValueEnum, Clone)]
 enum OperatingMode {
     Server,
     Client,
@@ -34,7 +47,7 @@ struct WorkQueue {
     has_stopped: bool,
 }
 
-#[derive(Parser)]
+#[derive(Encode, Decode, Parser, Clone)]
 struct Args {
     #[clap(value_enum, default_value_t = OperatingMode::Client)]
     #[arg(long)]
@@ -42,6 +55,9 @@ struct Args {
 
     #[arg(long)]
     root: Option<String>,
+
+    #[arg(long)]
+    client_pipe: Option<String>,
 
     #[clap(default_value_t = false)]
     #[arg(long)]
@@ -51,7 +67,34 @@ struct Args {
     #[arg(long, short)]
     word: bool,
 
+    #[clap(default_value_t = false)]
+    #[arg(long, short)]
+    main_server: bool,
+
     term: Option<String>,
+}
+
+fn write_to_pipe<T : Encode, C: Config>(reader: &mut BufReader<LocalSocketStream>, v: T, config: C) {
+    let encoded: Vec<u8> = bincode::encode_to_vec(v, config).unwrap();
+    let _ = reader.get_mut().write(&encoded.len().to_ne_bytes());
+    let _ = reader.get_mut().write_all(encoded.as_slice());
+}
+
+fn read_from_pipe<T: Decode, C: Config>(reader: &mut BufReader<LocalSocketStream>, config: C) -> T {
+    let mut struct_len_buffer = [0; mem::size_of::<usize>()];
+    let _ = reader.read_exact(&mut struct_len_buffer);
+    let struct_len = usize::from_ne_bytes(struct_len_buffer);
+    let mut buffer = vec![0u8; struct_len];
+    let _ = reader.read_exact(&mut buffer);
+    bincode::decode_from_slice(buffer.as_slice(), config).unwrap().0
+}
+
+fn convert_path(path: &Path) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    let new_path = PathBuf::from(path.display().to_string().replace("\\", "/"));
+    hasher.write(new_path.display().to_string().as_bytes());
+
+    PathBuf::from(hasher.finish().to_string())
 }
 
 fn filter_path(filters: &Vec<Filter>, path: &Path, root: &Path, is_dir: bool) -> bool {
@@ -130,8 +173,9 @@ struct Indexer2 {
 }
 
 impl Indexer2 {
-    const ENDING_MSG: &str = "###end###";
-    const ARG_SEP: &str = "\t";
+    const SERVER_TO_SERVER_ENDING_MSG: &str = "###server_to_server_end###";
+    const SERVER_TO_CLIENT_ENDING_MSG: &str = "###server_to_client_end###";
+    const MAIN_SERVER_ENDING_MSG: &str = "###main_server_end###";
 }
 
 impl Indexer2 {
@@ -159,8 +203,8 @@ impl Indexer2 {
                     }
                     let path_in_queue_count = work_queue.paths.len();
                     if path_in_queue_count > 0 {
-                        let file_count = min(path_in_queue_count, files_per_thread);
-                        for i in 0..file_count {
+                        let file_count = cmp::min(path_in_queue_count, files_per_thread);
+                        for _i in 0..file_count {
                             paths.push(work_queue.paths.pop().unwrap());
                         }
                     }
@@ -190,7 +234,7 @@ impl Indexer2 {
             if paths.len() > files_per_thread {
                 let (lock, cvar) = &*pair;
                 let mut work_queue = lock.lock().unwrap();
-                for i in 0..files_per_thread {
+                for _i in 0..files_per_thread {
                     work_queue.paths.push(paths.pop().unwrap());
                 }
                 cvar.notify_all();
@@ -221,10 +265,10 @@ impl Indexer2 {
         }
         let term = args.term.as_ref().unwrap().as_str();
         for (key, value) in &self.files {
-            if let Some(pos) = value.find(&term) {
+            if value.find(&term).is_some() {
                 let mut line_num = 1;
                 for line in value.lines() {
-                    if let Some(mut pos) = line.find(&term) {
+                    if line.find(&term).is_some() {
                         let mut found = false;
                         if args.word {
                             let line_bytes = line.as_bytes();
@@ -240,8 +284,8 @@ impl Indexer2 {
                         if !found {
                             continue;
                         }
-                        reader.get_mut().write_all(format!("{}:{}: {}", key.display().to_string(), line_num, line).as_bytes());
-                        reader.get_mut().write(b"\n");
+                        let _ = reader.get_mut().write_all(format!("{}:{}: {}", key.display().to_string(), line_num, line).as_bytes());
+                        let _ = reader.get_mut().write(b"\n");
                     }
                     line_num += 1;
                 }
@@ -250,25 +294,25 @@ impl Indexer2 {
     }
 
     fn list_files(&self, reader: &mut BufReader<LocalSocketStream>) {
-        for (key, value) in &self.files {
-            reader.get_mut().write_all(format!("{}", key.display().to_string()).as_bytes());
-            reader.get_mut().write(b"\n");
+        for (key, _value) in &self.files {
+            let _ = reader.get_mut().write_all(format!("{}", key.display().to_string()).as_bytes());
+            let _ = reader.get_mut().write(b"\n");
         }
     }
 
-    fn handle_event(&mut self, event: &event::Event, filters: &Vec<Filter>) {
+    fn handle_event(&mut self, event: &Event, filters: &Vec<Filter>) {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 for path in &event.paths {
                     if filter_path(&filters, path, self.root.as_path(), false) && path.is_file() {
-                        println!("handle create event: {}", path.display());
+                        println!("handle create/modify event: {}", path.display());
                         if let Ok(file_str) = std::fs::read_to_string(path.as_path()) {
                             self.files.insert(PathBuf::clone(path), file_str);
                         }
                     }
                 }
             },
-            EventKind::Remove(remove) => {
+            EventKind::Remove(_) => {
                 for path in &event.paths {
                     if filter_path(&filters, path, self.root.as_path(), false) && path.is_file() {
                         println!("handle remove event: {}", path.display());
@@ -284,7 +328,7 @@ impl Indexer2 {
 fn find_existing_pipe_name(path: &Path) -> Option<PathBuf> {
     let mut named_pipe_path = path;
     loop {
-        if LocalSocketListener::bind(named_pipe_path).is_err_and(|x| x.kind() == ErrorKind::PermissionDenied) {
+        if LocalSocketListener::bind(convert_path(&named_pipe_path)).is_err_and(|x| x.kind() == ErrorKind::PermissionDenied) {
             return Some(named_pipe_path.to_path_buf());
         }
         let parent_path = named_pipe_path.parent();
@@ -296,126 +340,211 @@ fn find_existing_pipe_name(path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn generate_pipe(path: &Path) -> (PathBuf, LocalSocketListener) {
+    let out_path;
+    let out_pipe;
+    loop {
+        let rand_str: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(30)
+                .map(char::from)
+                .collect();
+        let rand_path = convert_path(path.join(rand_str).as_path());
+        let pipe = LocalSocketListener::bind(rand_path.as_path());
+        if pipe.is_ok() {
+            out_path = rand_path;
+            out_pipe = pipe.unwrap();
+            break;
+        }
+    }
+    (out_path, out_pipe)
+}
+
+fn parse_filter(l: &str, filters: &mut Vec<Filter>) {
+    let mut line = l;
+    let mut filter = Filter {
+        should_include : true,
+        should_start_with : true,
+        should_end_with : true,
+        only_dir : false,
+        pattern : String::new(),
+    };
+    if line.starts_with("!") {
+        filter.should_include = false;
+        line = &line[1..]
+    }
+    if line.starts_with("*") {
+        filter.should_start_with = false;
+        line = &line[1..]
+    }
+    if line.ends_with("*") {
+        filter.should_end_with = false;
+        line = &line[0..line.len() - 1]
+    }
+    if line.ends_with("/") {
+        filter.only_dir = true;
+        line = &line[0..line.len() - 1]
+    }
+    let mut pattern = String::from(line);
+    if cfg!(target_os = "windows") {
+        pattern = pattern.replace("/", "\\");
+    } else {
+        pattern = pattern.replace("\\", "/");
+    }
+    filter.pattern = pattern;
+    filters.push(filter);
+}
+
 fn server_main(args: &Args) {
+    let config = config::standard();
     let root_str = args.root.as_ref().unwrap();
-    let path = Path::new(root_str.as_str());
-    let existing_pipe_name = find_existing_pipe_name(&path);
+    let path = PathBuf::from(root_str.as_str());
     if let Some(existing_pipe_name) = find_existing_pipe_name(&path) {
         println!("This directory or its parent directory has been indexed: {}", existing_pipe_name.display());
         return;
     }
 
     println!("Start indexing: {}", path.display());
-    let named_pipe = LocalSocketListener::bind(path).unwrap();
+    let named_pipe = LocalSocketListener::bind(convert_path(path.as_path())).unwrap();
 
     let mut filters: Vec<Filter> = Vec::new();
-    let config_path = Path::new(path).join(".hanoi");
+    let mut additional_dirs: Vec<PathBuf> = Vec::new();
+    let config_path = path.as_path().join(".hanoi");
     if let Ok(config_str) = std::fs::read_to_string(config_path) {
+        let mut section = "";
         for line in config_str.lines() {
-            let mut line = line.trim();
+            let line = line.trim();
             if line.is_empty() || line.starts_with("#") {
                 // Ignore comment
                 continue;
             }
 
-            let mut filter = Filter {
-                should_include : true,
-                should_start_with : true,
-                should_end_with : true,
-                only_dir : false,
-                pattern : String::new(),
-            };
-            if line.starts_with("!") {
-                filter.should_include = false;
-                line = &line[1..]
+            if line.starts_with("[") && line.ends_with("]") {
+                section = &line[1..line.len() - 1];
+                continue;
             }
-            if line.starts_with("*") {
-                filter.should_start_with = false;
-                line = &line[1..]
+            match section {
+                "filters" => parse_filter(&line, &mut filters),
+                "additional_dirs" => additional_dirs.push(PathBuf::from(line)),
+                &_ => println!("Line \"{}\" in an unknown section \"{}\"", line, section),
             }
-            if line.ends_with("*") {
-                filter.should_end_with = false;
-                line = &line[0..line.len() - 1]
-            }
-            if line.ends_with("/") {
-                filter.only_dir = true;
-                line = &line[0..line.len() - 1]
-            }
-            let mut pattern = String::from(line);
-            if cfg!(target_os = "windows") {
-                pattern = pattern.replace("/", "\\");
-            } else {
-                pattern = pattern.replace("\\", "/");
-            }
-            filter.pattern = pattern;
-            filters.push(filter);
         }
     }
 
     let mut indexer2 = Indexer2::default();
     {
-        let scope_time = ScopeTime::default();
+        let _scope_time = ScopeTime::default();
         indexer2.build(&path, &filters);
     }
     let indexer2 = Arc::new(Mutex::new(indexer2));
     let mut watcher;
     {
         let indexer2 = indexer2.clone();
-        watcher = notify::recommended_watcher(move |res: Result<event::Event>| {
+        watcher = notify::recommended_watcher(move |res: Result<Event>| {
             match res {
                Ok(event) => indexer2.lock().unwrap().handle_event(&event, &filters),
                Err(e) => println!("watch error: {:?}", e),
             }
         }).unwrap();
     }
-    watcher.watch(&path, RecursiveMode::Recursive);
+    let _ = watcher.watch(&path, RecursiveMode::Recursive);
 
-    loop {
-        for incoming in named_pipe.incoming() {
-            if let Some(stream) = incoming.ok() {
-                let mut incoming_reader = BufReader::new(stream);
-                let mut buffer = String::with_capacity(128);
-                incoming_reader.read_line(&mut buffer);
-                let client_args = Args::parse_from(buffer.trim().split(Indexer2::ARG_SEP));
+    let mut child_servers: Vec<Child> = Vec::with_capacity(additional_dirs.len());
+    for dir in &additional_dirs {
+        let child = Command::new("Hanoi")
+            .arg("--mode=server")
+            .arg(std::format!("--root={}", dir.display().to_string()))
+             .spawn()
+             .expect("failed to execute child");
+        child_servers.push(child);
+    }
+    for incoming in named_pipe.incoming() {
+        if let Some(stream) = incoming.ok() {
+            let mut incoming_reader = BufReader::new(stream);
+            let mut client_args : Args = read_from_pipe(&mut incoming_reader, config);
+            let pipe_path = PathBuf::from(client_args.client_pipe.as_ref().unwrap());
+            if let Ok(client_pipe) = LocalSocketStream::connect(pipe_path.as_path()) {
+                let mut client_reader = BufReader::new(client_pipe);
                 if client_args.files {
-                    indexer2.lock().unwrap().list_files(&mut incoming_reader);
-                } else {
-                    indexer2.lock().unwrap().find(&client_args, &mut incoming_reader);
+                    indexer2.lock().unwrap().list_files(&mut client_reader);
+                } else if client_args.term.is_some() {
+                    indexer2.lock().unwrap().find(&client_args, &mut client_reader);
                 }
-                incoming_reader.get_mut().write_all(Indexer2::ENDING_MSG.as_bytes());
-                incoming_reader.get_mut().write(b"\n");
+                let _ = client_reader.get_mut().write_all(Indexer2::SERVER_TO_CLIENT_ENDING_MSG.as_bytes());
+                let _ = client_reader.get_mut().write(b"\n");
+            }
+            // Send the arguments to child servers
+            let is_main_server = client_args.main_server;
+            if is_main_server {
+                client_args.main_server = false;
+            }
+            for dir in &additional_dirs {
+                if let Ok(additional_pipe) = LocalSocketStream::connect(convert_path(dir.as_path())) {
+                    let mut additional_buffer = BufReader::new(additional_pipe);
+                    write_to_pipe(&mut additional_buffer, client_args.clone(), config);
+                    loop {
+                        let mut msg = String::with_capacity(128);
+                        let _ = additional_buffer.read_line(&mut msg);
+                        let trimmed_msg = msg.trim();
+                        if trimmed_msg == Indexer2::SERVER_TO_SERVER_ENDING_MSG {
+                            break;
+                        }
+                        msg.clear();
+                    }
+                }
+            }
+            {
+                thread::sleep(Duration::from_millis(1)); // give some time for previous client_pipe to close
+            }
+            let _ = incoming_reader.get_mut().write_all(Indexer2::SERVER_TO_SERVER_ENDING_MSG.as_bytes());
+            let _ = incoming_reader.get_mut().write(b"\n");
+            if is_main_server {
+                let client_pipe = LocalSocketStream::connect(pipe_path.as_path()).ok().unwrap();
+                let mut client_reader = BufReader::new(client_pipe);
+                let _ = client_reader.get_mut().write_all(Indexer2::MAIN_SERVER_ENDING_MSG.as_bytes());
+                let _ = client_reader.get_mut().write(b"\n");
             }
         }
     }
 }
 
-fn client_main(args: &Args) {
-    let current_dir = std::env::current_dir().unwrap();
-    let existing_pipe_name = find_existing_pipe_name(&current_dir.as_path());
+fn client_main(args: &mut Args) {
+    let config = config::standard();
+    let root_dir = std::env::current_dir().unwrap();
+    let existing_pipe_name = find_existing_pipe_name(&root_dir.as_path());
     match existing_pipe_name {
         None => {
             println!("Please start the server for the current or parent directory");
         }
         Some(existing_pipe_name) => {
-            if let Ok(named_pipe) = LocalSocketStream::connect(existing_pipe_name) {
-                let mut pipe_buffer = BufReader::new(named_pipe);
-                let mut all_args : Vec<String> = Vec::new();
-                for argument in std::env::args() {
-                    all_args.push(argument);
-                }
-                pipe_buffer.get_mut().write_all(all_args.join(Indexer2::ARG_SEP).as_bytes());
-                pipe_buffer.get_mut().write(b"\n");
-                {
-                    let mut msg = String::with_capacity(128);
+            let (client_pipe_path, client_pipe) = generate_pipe(existing_pipe_name.as_path());
+            if let Ok(named_pipe) = LocalSocketStream::connect(convert_path(existing_pipe_name.as_path())) {
+                let mut main_server_reader = BufReader::new(named_pipe);
+                args.client_pipe = Some(client_pipe_path.display().to_string());
+                args.main_server = true;
+                write_to_pipe(&mut main_server_reader, args.clone(), config);
+            }
+
+            let mut msg = String::with_capacity(128);
+            let mut is_done = false;
+            for incoming in client_pipe.incoming() {
+                if let Some(stream) = incoming.ok() {
+                    let mut incoming_reader = BufReader::new(stream);
                     loop {
-                        pipe_buffer.read_line(&mut msg);
-                        let trimmed_msg = msg.trim();
-                        if trimmed_msg != Indexer2::ENDING_MSG {
-                            println!("{trimmed_msg}");
-                        } else {
-                            break;
-                        }
                         msg.clear();
+                        let _ = incoming_reader.read_line(&mut msg);
+                        let trimmed_msg = msg.trim();
+                        if trimmed_msg == Indexer2::SERVER_TO_CLIENT_ENDING_MSG {
+                            break;
+                        } else if trimmed_msg == Indexer2::MAIN_SERVER_ENDING_MSG {
+                            is_done = true;
+                            break;
+                        } else if !trimmed_msg.is_empty() {
+                            println!("{trimmed_msg}");
+                        }
+                    }
+                    if is_done {
+                        break;
                     }
                 }
             }
@@ -424,15 +553,13 @@ fn client_main(args: &Args) {
 }
 
 fn main() {
-    let args = Args::parse();
-    let mut has_named_pipe = false;
-    let mode = OperatingMode::Server;
+    let mut args = Args::parse();
     match args.mode {
         OperatingMode::Server => {
-            server_main(&args);
+            server_main(&mut args);
         }
         OperatingMode::Client => {
-            client_main(&args);
+            client_main(&mut args);
         }
     }
 }
