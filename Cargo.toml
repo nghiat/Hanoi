@@ -6,6 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bincode = "2.0.0-rc.3"
 clap = { version = "4.4.4", features = ["derive"] }
 interprocess = "1.2.1"
 notify = "6.1.1"
+rand = "0.8.5"
